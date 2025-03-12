@@ -37,3 +37,35 @@ The **Speed Staking Token ($SST)** is a **staking-based execution priority syste
 - Users can create **governance proposals** to adjust **protocol fees, incentives, and execution logic**.
 
 ---
+
+## ⚙️ Smart Contract(program) Architecture
+
+### 📄 **Staking Contract (`lib.rs`)**
+The **Solana smart contract** is built using the **Anchor framework**.
+
+### **🔹 Instructions**
+#### 1️⃣ `stake(amount: u64)`
+- Stakes $SST tokens with **no lock period**.
+- Provides **basic fee discounts** but **no bonus rewards**.
+
+#### 2️⃣ `stake_with_lock(amount: u64, lock_period: u64)`
+- Stakes $SST tokens with a **lock period** (30, 90, or 180 days).
+- Grants **additional fee discounts** and **execution priority**.
+
+#### 3️⃣ `unstake(amount: u64)`
+- Withdraws **staked $SST** (if unlocked).
+- Locked tokens **cannot be unstaked early**.
+
+#### 4️⃣ `execute_trade(order_execution_time: u64)`
+- Applies **dynamic fee discounts** based on staking level.
+- **Rewards ultra-fast execution** (trades within **100ms**).
+
+#### 5️⃣ `claim_rewards(liquidity_provided: u64)`
+- Claims and **auto-compounds** staking rewards.
+- **Boosts LP yield** based on liquidity contribution.
+
+#### 6️⃣ `create_proposal(description: String)`
+- Allows users to **submit governance proposals** for protocol upgrades.
+
+---
+
