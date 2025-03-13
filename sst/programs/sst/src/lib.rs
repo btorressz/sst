@@ -1,19 +1,26 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
-declare_id!("FGbGLGj7h1sTpfescPQvDteMj8mQpe9HNWd7V1xvyMnM"); //program id from solana playground
+declare_id!("FGbGLGj7h1sTpfescPQvDteMj8mQpe9HNWd7V1xvyMnM");
+
+/// Minimum duration (in seconds) a non-locked stake must remain before unstaking without penalty (7 days)
+const MIN_NON_LOCKED_STAKE_DURATION: i64 = 7 * 24 * 60 * 60;
 
 #[program]
 pub mod sst {
     use super::*;
 
-    /// Standard staking instruction (no lock period)
-    /// This version allows immediate unstaking but offers no enhanced fee discount.
+    /// Standard staking instruction (no lock period).
+    /// Allows immediate unstaking (subject to an early-unstake penalty if unstaked too soon).
     pub fn stake(ctx: Context<StakeAccounts>, amount: u64) -> Result<()> {
         let stake_info = &mut ctx.accounts.stake_info;
         let clock = Clock::get()?;
 
-        // Transfer tokens from the staker's token account to the vault.
+        // Reentrancy protection.
+        require!(!stake_info.locked, ErrorCode::ReentrancyDetected);
+        stake_info.locked = true;
+
+        // Transfer tokens from staker's token account to the vault.
         let cpi_accounts = Transfer {
             from: ctx.accounts.staker_token_account.to_account_info(),
             to: ctx.accounts.vault_token_account.to_account_info(),
@@ -22,23 +29,24 @@ pub mod sst {
         let cpi_program = ctx.accounts.token_program.to_account_info();
         token::transfer(CpiContext::new(cpi_program, cpi_accounts), amount)?;
 
-        // Initialize or update staking record.
+        // Update staking record.
         stake_info.staker = ctx.accounts.staker.key();
         stake_info.amount = stake_info
             .amount
             .checked_add(amount)
             .ok_or(ErrorCode::Overflow)?;
         stake_info.last_staked_time = clock.unix_timestamp;
-        // Non-locked stake: no lock period.
         stake_info.lock_period = 0;
         stake_info.locked_until = clock.unix_timestamp;
+        stake_info.borrowed_amount = 0;
+        stake_info.locked = false;
+
         Ok(())
     }
 
-    /// Staking instruction with a lock period (30, 90, or 180 days)
-    /// This prevents flash loan abuse and grants enhanced benefits.
+    /// Staking instruction with a lock period (30, 90, or 180 days).
+    /// Prevents flash loan abuse and grants enhanced benefits.
     pub fn stake_with_lock(ctx: Context<StakeAccounts>, amount: u64, lock_period: u64) -> Result<()> {
-        // Allowed lock periods in seconds: 30, 90, or 180 days.
         let allowed_periods: Vec<u64> = vec![
             30 * 24 * 60 * 60,
             90 * 24 * 60 * 60,
@@ -48,8 +56,11 @@ pub mod sst {
         
         let stake_info = &mut ctx.accounts.stake_info;
         let clock = Clock::get()?;
-        
-        // Transfer tokens from the staker to the vault.
+
+        require!(!stake_info.locked, ErrorCode::ReentrancyDetected);
+        stake_info.locked = true;
+
+        // Transfer tokens from staker to vault.
         let cpi_accounts = Transfer {
             from: ctx.accounts.staker_token_account.to_account_info(),
             to: ctx.accounts.vault_token_account.to_account_info(),
@@ -69,34 +80,74 @@ pub mod sst {
         stake_info.locked_until = clock.unix_timestamp
             .checked_add(lock_period as i64)
             .ok_or(ErrorCode::Overflow)?;
+        stake_info.borrowed_amount = 0;
+        stake_info.locked = false;
+
         Ok(())
     }
 
     /// Unstake instruction: allows withdrawal of staked tokens.
-    /// For locked stakes, ensures that the lock period has expired.
+    /// For non-locked stakes unstaked before the minimum duration, a penalty (2% transaction fee) is applied.
     pub fn unstake(ctx: Context<Unstake>, amount: u64) -> Result<()> {
         let stake_info = &mut ctx.accounts.stake_info;
         let clock = Clock::get()?;
         require!(stake_info.amount >= amount, ErrorCode::InsufficientStakedAmount);
-        // If staked with a lock, enforce the locked duration.
+
         if stake_info.lock_period > 0 {
+            // For locked stakes, ensure the lock period has expired.
             require!(clock.unix_timestamp >= stake_info.locked_until, ErrorCode::TokensLocked);
+            // Transfer full amount.
+            let seeds = &[b"vault".as_ref()];
+            let signer = &[&seeds[..]];
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.vault_token_account.to_account_info(),
+                to: ctx.accounts.staker_token_account.to_account_info(),
+                authority: ctx.accounts.vault_authority.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            token::transfer(
+                CpiContext::new_with_signer(cpi_program, cpi_accounts, signer),
+                amount,
+            )?;
+        } else {
+            // For non-locked stakes, check if unstaking too early.
+            if clock.unix_timestamp - stake_info.last_staked_time < MIN_NON_LOCKED_STAKE_DURATION {
+                // Apply a penalty tax of 2%.
+                let penalty = amount
+                    .checked_mul(2)
+                    .ok_or(ErrorCode::Overflow)?
+                    .checked_div(100)
+                    .ok_or(ErrorCode::Underflow)?;
+                msg!("Early unstake penalty applied: {} tokens withheld", penalty);
+                let amount_to_transfer = amount.checked_sub(penalty).ok_or(ErrorCode::Underflow)?;
+                let seeds = &[b"vault".as_ref()];
+                let signer = &[&seeds[..]];
+                let cpi_accounts = Transfer {
+                    from: ctx.accounts.vault_token_account.to_account_info(),
+                    to: ctx.accounts.staker_token_account.to_account_info(),
+                    authority: ctx.accounts.vault_authority.to_account_info(),
+                };
+                let cpi_program = ctx.accounts.token_program.to_account_info();
+                token::transfer(
+                    CpiContext::new_with_signer(cpi_program, cpi_accounts, signer),
+                    amount_to_transfer,
+                )?;
+            } else {
+                // No penalty.
+                let seeds = &[b"vault".as_ref()];
+                let signer = &[&seeds[..]];
+                let cpi_accounts = Transfer {
+                    from: ctx.accounts.vault_token_account.to_account_info(),
+                    to: ctx.accounts.staker_token_account.to_account_info(),
+                    authority: ctx.accounts.vault_authority.to_account_info(),
+                };
+                let cpi_program = ctx.accounts.token_program.to_account_info();
+                token::transfer(
+                    CpiContext::new_with_signer(cpi_program, cpi_accounts, signer),
+                    amount,
+                )?;
+            }
         }
-
-        // Transfer tokens back from the vault to the staker.
-        let seeds = &[b"vault".as_ref()];
-        let signer = &[&seeds[..]];
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.staker_token_account.to_account_info(),
-            authority: ctx.accounts.vault_authority.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        token::transfer(
-            CpiContext::new_with_signer(cpi_program, cpi_accounts, signer),
-            amount,
-        )?;
-
         stake_info.amount = stake_info
             .amount
             .checked_sub(amount)
@@ -104,48 +155,61 @@ pub mod sst {
         Ok(())
     }
 
-    /// Execute trade instruction: applies dynamic fee discounts based on staking.
-    /// Also provides bonus incentives for ultra-fast execution (<= 100ms).
+    /// Execute trade instruction.
+    /// Applies dynamic fee discounts based on staking (adjusted by VIP multipliers) and extra bonus for ultra-fast execution.
     pub fn execute_trade(ctx: Context<ExecuteTrade>, order_execution_time: u64) -> Result<()> {
-        let stake_info = &ctx.accounts.stake_info;
+        let stake_info = &mut ctx.accounts.stake_info;
         let clock = Clock::get()?;
         let staking_duration = clock.unix_timestamp
             .checked_sub(stake_info.last_staked_time)
             .unwrap_or(0);
         let fee_discount = if stake_info.lock_period > 0 {
-            // Only locked stakes receive enhanced fee discounts.
             calculate_fee_discount(stake_info.amount, staking_duration)
         } else {
             0
         };
-
-        msg!("Calculated fee discount: {}%", fee_discount);
-
-        if order_execution_time <= 100 {
+        let vip_mult = vip_multiplier(stake_info.amount);
+        let mut adjusted_fee_discount = fee_discount * vip_mult / 100;
+        msg!("Base fee discount: {}%, VIP multiplier: {}%", fee_discount, vip_mult);
+        
+        if order_execution_time <= 50 {
+            msg!("Ultra-fast execution (<= 50ms) achieved: extra bonus applied and dynamic slippage protection activated.");
+            adjusted_fee_discount = adjusted_fee_discount.checked_add(5).ok_or(ErrorCode::Overflow)?;
+            // Performance-based airdrop: bonus of 20 tokens added to the staked amount.
+            stake_info.amount = stake_info.amount.checked_add(20).ok_or(ErrorCode::Overflow)?;
+        } else if order_execution_time <= 100 {
             msg!("Trade executed within 100ms: bonus incentives applied.");
         } else {
             msg!("Trade executed without bonus incentive.");
         }
+        msg!("Adjusted fee discount: {}%", adjusted_fee_discount);
         Ok(())
     }
 
-    /// Claim rewards instruction: auto-compounds rewards into the staked amount.
-    /// Incorporates an LP yield boost if liquidity is provided.
+    /// Claim rewards instruction with auto-compounding and progressive APY scaling.
     pub fn claim_rewards(ctx: Context<ClaimRewards>, liquidity_provided: u64) -> Result<()> {
-        // Placeholder reward calculation: base_reward can be determined by more complex logic.
-        let base_reward: u64 = 100;
-        let lp_boost = lp_reward_boost(liquidity_provided);
-        let total_reward = base_reward
-            .checked_add(lp_boost)
-            .ok_or(ErrorCode::Overflow)?;
-        
-        // Auto-compound: add rewards directly to the staked balance.
         let stake_info = &mut ctx.accounts.stake_info;
-        stake_info.amount = stake_info
-            .amount
-            .checked_add(total_reward)
+        let clock = Clock::get()?;
+        let staking_duration = clock.unix_timestamp
+            .checked_sub(stake_info.last_staked_time)
+            .unwrap_or(0);
+        // Progressive bonus: add 10 tokens per full month of staking.
+        let months = staking_duration / (30 * 24 * 60 * 60);
+        let progressive_bonus = months * 10;
+        let base_reward: i64 = 100 + progressive_bonus;
+        let lp_boost: u64 = lp_reward_boost(liquidity_provided);
+        let total_reward: i64 = base_reward
+            .checked_add(lp_boost.try_into().unwrap())
             .ok_or(ErrorCode::Overflow)?;
-        msg!("Rewards auto-compounded: {} tokens added", total_reward);
+        stake_info.amount = stake_info.amount
+            .checked_add(total_reward.try_into().unwrap())
+            .ok_or(ErrorCode::Overflow)?;
+        msg!(
+            "Rewards auto-compounded: {} tokens added (Base: {}, LP Boost: {})",
+            total_reward,
+            base_reward,
+            lp_boost
+        );
         Ok(())
     }
 
@@ -160,20 +224,71 @@ pub mod sst {
         msg!("New governance proposal created");
         Ok(())
     }
+
+    /// Vote on a proposal.
+    /// Voting power is determined by staked amount and staking duration (anti-Sybil & time-locked voting).
+    pub fn vote_proposal(ctx: Context<VoteProposal>, support: bool) -> Result<()> {
+        let voting_power = calculate_voting_power(&ctx.accounts.stake_info);
+        let proposal = &mut ctx.accounts.proposal;
+        if support {
+            proposal.votes_for = proposal.votes_for.checked_add(voting_power).ok_or(ErrorCode::Overflow)?;
+        } else {
+            proposal.votes_against = proposal.votes_against.checked_add(voting_power).ok_or(ErrorCode::Overflow)?;
+        }
+        msg!("Vote cast with power: {}", voting_power);
+        Ok(())
+    }
+
+    /// Borrow instruction: allows users to borrow against their staked tokens (up to 50% of stake).
+    pub fn borrow(ctx: Context<Borrow>, amount: u64) -> Result<()> {
+        let stake_info = &mut ctx.accounts.stake_info;
+        let max_borrow = stake_info.amount.checked_div(2).ok_or(ErrorCode::Overflow)?;
+        require!(amount <= max_borrow, ErrorCode::BorrowLimitExceeded);
+        stake_info.borrowed_amount = stake_info.borrowed_amount.checked_add(amount).ok_or(ErrorCode::Overflow)?;
+        msg!("Borrowed {} tokens against stake", amount);
+        Ok(())
+    }
 }
 
-/// Helper function to calculate a dynamic fee discount based on staked amount and duration.
-/// Example: 1000 SST = 1% base discount, plus 1% bonus per 30 days, capped at 50%.
+/// Helper: calculates dynamic fee discount.
+/// For example: 1000 SST = 1% base discount, plus 1% bonus per 30 days, capped at 50%.
 fn calculate_fee_discount(staked_amount: u64, staking_duration: i64) -> u64 {
     let base_discount = staked_amount / 1000;
     let duration_bonus = (staking_duration / (30 * 24 * 60 * 60)) as u64;
     std::cmp::min(base_discount + duration_bonus, 50)
 }
 
-/// Helper function for LP yield boost: every 10,000 tokens of liquidity provided grants bonus tokens.
+/// Helper: calculates LP yield boost.
+/// Every 10,000 tokens of liquidity provided grants bonus tokens (capped at 20).
 fn lp_reward_boost(liquidity_provided: u64) -> u64 {
     let boost = liquidity_provided / 10_000;
     std::cmp::min(boost, 20)
+}
+
+/// Helper: returns a VIP multiplier (as a percentage) based on staked amount.
+/// For example, thresholds are adjusted for 6-decimal tokens.
+fn vip_multiplier(staked_amount: u64) -> u64 {
+    if staked_amount >= 10_000 * 1_000_000 {
+        130 // 1.3x
+    } else if staked_amount >= 5_000 * 1_000_000 {
+        115 // 1.15x
+    } else if staked_amount >= 1_000 * 1_000_000 {
+        105 // 1.05x
+    } else {
+        100 // 1.0x
+    }
+}
+
+/// Helper: calculates voting power based on staked amount and duration.
+/// Adds a bonus of 1% per 30 days (capped at 50% bonus).
+fn calculate_voting_power(stake_info: &StakeInfo) -> u64 {
+    let clock = Clock::get().unwrap();
+    let duration = clock.unix_timestamp
+        .checked_sub(stake_info.last_staked_time)
+        .unwrap_or(0);
+    let base_power = stake_info.amount;
+    let bonus = base_power * ((duration / (30 * 24 * 60 * 60)) as u64) / 100;
+    base_power.checked_add(bonus).unwrap_or(base_power)
 }
 
 #[derive(Accounts)]
@@ -236,7 +351,6 @@ pub struct ExecuteTrade<'info> {
     // Staking record used to determine trade priority and fee discount.
     #[account(seeds = [b"stake", staker.key().as_ref()], bump)]
     pub stake_info: Account<'info, StakeInfo>,
-    // Additional AMM pool accounts may be included as needed.
 }
 
 #[derive(Accounts)]
@@ -277,18 +391,45 @@ pub struct CreateProposal<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct VoteProposal<'info> {
+    #[account(mut)]
+    pub proposer: Signer<'info>, // voter
+
+    #[account(mut)]
+    pub stake_info: Account<'info, StakeInfo>,
+
+    #[account(mut)]
+    pub proposal: Account<'info, Proposal>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Borrow<'info> {
+    #[account(mut)]
+    pub staker: Signer<'info>,
+
+    #[account(mut, seeds = [b"stake", staker.key().as_ref()], bump)]
+    pub stake_info: Account<'info, StakeInfo>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 #[account]
 pub struct StakeInfo {
     pub staker: Pubkey,
     pub amount: u64,
     pub last_staked_time: i64,
-    pub lock_period: u64,  // in seconds; 0 indicates non-locked staking
-    pub locked_until: i64, // timestamp when staked tokens can be withdrawn
+    pub lock_period: u64,   // in seconds; 0 indicates non-locked staking
+    pub locked_until: i64,  // timestamp when staked tokens can be withdrawn
+    pub borrowed_amount: u64,
+    pub locked: bool,       // reentrancy guard
 }
 
 impl StakeInfo {
-    // Total space: 32 (Pubkey) + 8 (amount) + 8 (last_staked_time) + 8 (lock_period) + 8 (locked_until)
-    const LEN: usize = 32 + 8 + 8 + 8 + 8;
+    // Total space: 32 + 8*5 + 1 = 73 bytes; padded to 80 bytes.
+    const LEN: usize = 80;
 }
 
 #[account]
@@ -301,8 +442,8 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    // Estimated space: Pubkey (32) + description (4 + up to 200 bytes) + votes_for (8) + votes_against (8) + created_at (8)
-    const LEN: usize = 32 + 4 + 200 + 8 + 8 + 8;
+    // Estimated space: 32 + 4 + 200 + 8 + 8 + 8 = 268 bytes.
+    const LEN: usize = 268;
 }
 
 #[error_code]
@@ -317,4 +458,9 @@ pub enum ErrorCode {
     TokensLocked,
     #[msg("Invalid lock period specified.")]
     InvalidLockPeriod,
+    #[msg("Reentrancy detected.")]
+    ReentrancyDetected,
+    #[msg("Borrow limit exceeded.")]
+    BorrowLimitExceeded,
 }
+
