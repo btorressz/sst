@@ -5,6 +5,8 @@ declare_id!("FGbGLGj7h1sTpfescPQvDteMj8mQpe9HNWd7V1xvyMnM");
 
 /// Minimum duration (in seconds) a non-locked stake must remain before unstaking without penalty (7 days)
 const MIN_NON_LOCKED_STAKE_DURATION: i64 = 7 * 24 * 60 * 60;
+/// VIP threshold: 100,000 SST (assuming 6 decimals)
+const VIP_THRESHOLD: u64 = 100_000 * 1_000_000;
 
 #[program]
 pub mod sst {
@@ -40,6 +42,8 @@ pub mod sst {
         stake_info.locked_until = clock.unix_timestamp;
         stake_info.borrowed_amount = 0;
         stake_info.locked = false;
+        // Default auto-restake is false.
+        stake_info.auto_restake = false;
 
         Ok(())
     }
@@ -82,21 +86,32 @@ pub mod sst {
             .ok_or(ErrorCode::Overflow)?;
         stake_info.borrowed_amount = 0;
         stake_info.locked = false;
+        stake_info.auto_restake = false;
 
         Ok(())
     }
 
     /// Unstake instruction: allows withdrawal of staked tokens.
-    /// For non-locked stakes unstaked before the minimum duration, a penalty (2% transaction fee) is applied.
+    /// - For non-locked stakes: if unstaked before MIN_NON_LOCKED_STAKE_DURATION, a penalty (2% transaction fee) is applied.
+    /// - For locked stakes: Progressive unlocking is applied based on time elapsed.
     pub fn unstake(ctx: Context<Unstake>, amount: u64) -> Result<()> {
         let stake_info = &mut ctx.accounts.stake_info;
         let clock = Clock::get()?;
+
         require!(stake_info.amount >= amount, ErrorCode::InsufficientStakedAmount);
 
         if stake_info.lock_period > 0 {
-            // For locked stakes, ensure the lock period has expired.
-            require!(clock.unix_timestamp >= stake_info.locked_until, ErrorCode::TokensLocked);
-            // Transfer full amount.
+            // Progressive unlocking for locked stakes.
+            let time_elapsed = clock.unix_timestamp.checked_sub(stake_info.last_staked_time)
+                .ok_or(ErrorCode::Underflow)?;
+            let unlock_ratio = if time_elapsed >= stake_info.lock_period as i64 {
+                1.0
+            } else {
+                time_elapsed as f64 / stake_info.lock_period as f64
+            };
+            let unlocked_amount = (stake_info.amount as f64 * unlock_ratio).floor() as u64;
+            require!(amount <= unlocked_amount, ErrorCode::TokensLocked);
+            
             let seeds = &[b"vault".as_ref()];
             let signer = &[&seeds[..]];
             let cpi_accounts = Transfer {
@@ -156,7 +171,8 @@ pub mod sst {
     }
 
     /// Execute trade instruction.
-    /// Applies dynamic fee discounts based on staking (adjusted by VIP multipliers) and extra bonus for ultra-fast execution.
+    /// Applies dynamic fee discounts based on staking, adjusted by VIP multipliers,
+    /// a duration-based bonus, and extra bonus for ultra-fast execution.
     pub fn execute_trade(ctx: Context<ExecuteTrade>, order_execution_time: u64) -> Result<()> {
         let stake_info = &mut ctx.accounts.stake_info;
         let clock = Clock::get()?;
@@ -168,14 +184,34 @@ pub mod sst {
         } else {
             0
         };
+
         let vip_mult = vip_multiplier(stake_info.amount);
         let mut adjusted_fee_discount = fee_discount * vip_mult / 100;
         msg!("Base fee discount: {}%, VIP multiplier: {}%", fee_discount, vip_mult);
-        
+
+        // Dynamic execution priority bonus based on staking duration.
+        let duration_priority_bonus = if staking_duration >= 180 * 24 * 60 * 60 {
+            5
+        } else if staking_duration >= 90 * 24 * 60 * 60 {
+            3
+        } else if staking_duration >= 30 * 24 * 60 * 60 {
+            1
+        } else {
+            0
+        };
+        adjusted_fee_discount = adjusted_fee_discount.checked_add(duration_priority_bonus).ok_or(ErrorCode::Overflow)?;
+        msg!("Duration priority bonus: {}%", duration_priority_bonus);
+
+        // VIP boost for institutional traders.
+        if stake_info.amount >= VIP_THRESHOLD {
+            adjusted_fee_discount = adjusted_fee_discount.checked_add(10).ok_or(ErrorCode::Overflow)?;
+            msg!("Institutional VIP boost applied.");
+        }
+
         if order_execution_time <= 50 {
             msg!("Ultra-fast execution (<= 50ms) achieved: extra bonus applied and dynamic slippage protection activated.");
             adjusted_fee_discount = adjusted_fee_discount.checked_add(5).ok_or(ErrorCode::Overflow)?;
-            // Performance-based airdrop: bonus of 20 tokens added to the staked amount.
+            // Performance-based airdrop: bonus of 20 tokens added.
             stake_info.amount = stake_info.amount.checked_add(20).ok_or(ErrorCode::Overflow)?;
         } else if order_execution_time <= 100 {
             msg!("Trade executed within 100ms: bonus incentives applied.");
@@ -187,6 +223,7 @@ pub mod sst {
     }
 
     /// Claim rewards instruction with auto-compounding and progressive APY scaling.
+    /// If auto-restake is enabled, rewards are compounded into the stake; otherwise, they're transferred.
     pub fn claim_rewards(ctx: Context<ClaimRewards>, liquidity_provided: u64) -> Result<()> {
         let stake_info = &mut ctx.accounts.stake_info;
         let clock = Clock::get()?;
@@ -201,15 +238,27 @@ pub mod sst {
         let total_reward: i64 = base_reward
             .checked_add(lp_boost.try_into().unwrap())
             .ok_or(ErrorCode::Overflow)?;
-        stake_info.amount = stake_info.amount
-            .checked_add(total_reward.try_into().unwrap())
-            .ok_or(ErrorCode::Overflow)?;
-        msg!(
-            "Rewards auto-compounded: {} tokens added (Base: {}, LP Boost: {})",
-            total_reward,
-            base_reward,
-            lp_boost
-        );
+            
+        if stake_info.auto_restake {
+            stake_info.amount = stake_info.amount
+                .checked_add(total_reward.try_into().unwrap())
+                .ok_or(ErrorCode::Overflow)?;
+            msg!("Rewards auto-compounded: {} tokens added (Base: {}, LP Boost: {})", total_reward, base_reward, lp_boost);
+        } else {
+            let seeds = &[b"vault".as_ref()];
+            let signer = &[&seeds[..]];
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.reward_vault.to_account_info(),
+                to: ctx.accounts.staker_token_account.to_account_info(),
+                authority: ctx.accounts.vault_authority.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            token::transfer(
+                CpiContext::new_with_signer(cpi_program, cpi_accounts, signer),
+                total_reward.try_into().unwrap()
+            )?;
+            msg!("Rewards claimed: {} tokens transferred to staker account", total_reward);
+        }
         Ok(())
     }
 
@@ -246,6 +295,14 @@ pub mod sst {
         require!(amount <= max_borrow, ErrorCode::BorrowLimitExceeded);
         stake_info.borrowed_amount = stake_info.borrowed_amount.checked_add(amount).ok_or(ErrorCode::Overflow)?;
         msg!("Borrowed {} tokens against stake", amount);
+        Ok(())
+    }
+
+    /// Toggle the auto-restake option.
+    pub fn toggle_auto_restake(ctx: Context<ToggleAutoRestake>, enabled: bool) -> Result<()> {
+        let stake_info = &mut ctx.accounts.stake_info;
+        stake_info.auto_restake = enabled;
+        msg!("Auto-restake toggled to: {}", enabled);
         Ok(())
     }
 }
@@ -296,7 +353,7 @@ pub struct StakeAccounts<'info> {
     #[account(mut)]
     pub staker: Signer<'info>,
 
-    // PDA to track staking details; created if not already present.
+    /// PDA to track staking details; created if not already present.
     #[account(
         init,
         payer = staker,
@@ -306,11 +363,11 @@ pub struct StakeAccounts<'info> {
     )]
     pub stake_info: Account<'info, StakeInfo>,
 
-    // Token account holding the staker's $SST tokens.
+    /// Token account holding the staker's $SST tokens.
     #[account(mut)]
     pub staker_token_account: Box<Account<'info, TokenAccount>>,
 
-    // Vault token account where staked tokens are held.
+    /// Vault token account where staked tokens are held.
     #[account(mut)]
     pub vault_token_account: Box<Account<'info, TokenAccount>>,
 
@@ -327,7 +384,7 @@ pub struct Unstake<'info> {
     #[account(mut)]
     pub staker: Signer<'info>,
 
-    // Existing staking record.
+    /// Existing staking record.
     #[account(mut, seeds = [b"stake", staker.key().as_ref()], bump)]
     pub stake_info: Account<'info, StakeInfo>,
 
@@ -348,7 +405,7 @@ pub struct ExecuteTrade<'info> {
     #[account(mut)]
     pub staker: Signer<'info>,
 
-    // Staking record used to determine trade priority and fee discount.
+    /// Staking record used to determine trade priority and fee discount.
     #[account(seeds = [b"stake", staker.key().as_ref()], bump)]
     pub stake_info: Account<'info, StakeInfo>,
 }
@@ -358,7 +415,7 @@ pub struct ClaimRewards<'info> {
     #[account(mut)]
     pub staker: Signer<'info>,
 
-    // Staking record to which rewards will be compounded.
+    /// Staking record to which rewards will be compounded.
     #[account(mut, seeds = [b"stake", staker.key().as_ref()], bump)]
     pub stake_info: Account<'info, StakeInfo>,
 
@@ -372,6 +429,13 @@ pub struct ClaimRewards<'info> {
     pub vault_authority: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ToggleAutoRestake<'info> {
+    #[account(mut, seeds = [b"stake", staker.key().as_ref()], bump)]
+    pub stake_info: Account<'info, StakeInfo>,
+    pub staker: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -425,10 +489,11 @@ pub struct StakeInfo {
     pub locked_until: i64,  // timestamp when staked tokens can be withdrawn
     pub borrowed_amount: u64,
     pub locked: bool,       // reentrancy guard
+    pub auto_restake: bool, // toggle for auto-compounding rewards
 }
 
 impl StakeInfo {
-    // Total space: 32 + 8*5 + 1 = 73 bytes; padded to 80 bytes.
+    // Total space: 32 + 8*5 + 1*2 = 32 + 40 + 2 = 74 bytes; padded to 80 bytes.
     const LEN: usize = 80;
 }
 
