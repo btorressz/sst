@@ -125,3 +125,7 @@ The **Solana smart contract** is built using the **Anchor framework**.
 - **Flash loan risk mitigation** via **minimum stake duration rules**.
 
 ---
+
+# LiCENSE: MIT LICENSE
+
+---
